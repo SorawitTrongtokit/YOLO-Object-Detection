@@ -1,13 +1,25 @@
-import streamlit as st
-from ultralytics import YOLO
 import os
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import psycopg2
 from dotenv import load_dotenv
+from ultralytics import YOLO
 
-# โหลด environment variables จากไฟล์.env
+# โหลด environment variables จากไฟล์ .env
 load_dotenv()
 
-# เชื่อมต่อกับฐานข้อมูล PostgreSQL (เหมือนเดิม)
+# สร้าง Flask application
+app = Flask(__name__)
+CORS(app)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your_default_secret_key')
+
+# กำหนด path สำหรับอัปโหลดไฟล์
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+# เชื่อมต่อกับฐานข้อมูล PostgreSQL
 def get_db_connection():
     try:
         conn = psycopg2.connect(
@@ -21,7 +33,7 @@ def get_db_connection():
         print(f"Database connection error: {e}")
         return None
 
-# โหลดโมเดล YOLOv8 (เหมือนเดิม)
+# โหลดโมเดล YOLOv8
 model_path = os.environ.get('MODEL_PATH', 'model/best.pt')
 try:
     model = YOLO(model_path)
@@ -30,7 +42,7 @@ except Exception as e:
     print(f"Error loading YOLOv8 model: {e}")
     exit()
 
-# ฟังก์ชันสำหรับดึงราคาจากฐานข้อมูล (เหมือนเดิม)
+# ฟังก์ชันสำหรับดึงราคาจากฐานข้อมูล
 def get_price(product_name):
     conn = get_db_connection()
     if not conn:
@@ -40,7 +52,7 @@ def get_price(product_name):
         cur = conn.cursor()
         cur.execute("SELECT price FROM products WHERE name = %s", (product_name,))
         price = cur.fetchone()
-        return float(price) if price else None
+        return float(price[0]) if price else None
     except psycopg2.Error as e:
         print(f"Database error: {e}")
         return None
@@ -48,37 +60,56 @@ def get_price(product_name):
         if conn:
             conn.close()
 
-# Streamlit app
-st.title('Image Price Checker')
+# API endpoint สำหรับรับภาพและประมวลผล
+@app.route('/api/process', methods=['POST'])
+def process_image_api():
+    try:
+        # ตรวจสอบว่ามีไฟล์ภาพถูกส่งมาหรือไม่
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'message': 'No image file found'})
 
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
-if uploaded_file is not None:
-    # บันทึกไฟล์ภาพ
-    #  ตรวจสอบว่ามีโฟลเดอร์ temp หรือไม่  ถ้าไม่มีให้สร้าง
-    if not os.path.exists("temp"):
-        os.makedirs("temp")
-    image_path = os.path.join("temp", uploaded_file.name)
-    with open(image_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        image_file = request.files['image']
 
-    # ประมวลผลภาพ
-    results = model(image_path)
-    prices =
-    for result in results:
-        for box in result.boxes.data.tolist():
-            x1, y1, x2, y2, confidence, class_id = box
-            product_name = result.names[int(class_id)]
-            price = get_price(product_name)
-            if price:
-                prices.append({'product': product_name, 'price': price})
+        # ตรวจสอบว่าผู้ใช้เลือกไฟล์หรือไม่
+        if image_file.filename == '':
+            return jsonify({'success': False, 'message': 'No selected file'})
 
-    # แสดงผลลัพธ์
-    if prices:
-        st.success("Found these products:")
-        for item in prices:
-            st.write(f"{item['product']}: {item['price']} บาท")
-    else:
-        st.warning("No products found in the image.")
+        # ตรวจสอบนามสกุลไฟล์
+        allowed_extensions = {'png', 'jpg', 'jpeg'}
+        file_extension = image_file.filename.split('.')[-1].lower()
+        if '.' not in image_file.filename or file_extension not in allowed_extensions:
+            return jsonify({'success': False, 'message': 'Invalid file type. Only PNG, JPG, and JPEG are allowed.'})
 
-    # ลบไฟล์ภาพ
-    os.remove(image_path)
+        # บันทึกไฟล์ภาพ
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], image_file.filename)
+        image_file.save(image_path)
+
+        # ประมวลผลภาพด้วย YOLOv8
+        results = model(image_path)
+        prices = []
+
+        # วนลูปผ่านผลลัพธ์
+        for result in results:
+            for box in result.boxes.data.tolist():
+                x1, y1, x2, y2, confidence, class_id = box
+                product_name = result.names[int(class_id)]
+                price = get_price(product_name)
+                if price:
+                    prices.append({'product': product_name, 'price': price})
+
+        # ลบไฟล์ภาพหลังจากประมวลผลเสร็จสิ้น
+        if os.path.exists(image_path):
+            os.remove(image_path)
+
+        # ส่งผลลัพธ์กลับเป็น JSON
+        return jsonify({'success': True, 'prices': prices})
+
+    except Exception as e:
+        # ลบไฟล์ภาพหากเกิดข้อผิดพลาด
+        if 'image_path' in locals() and os.path.exists(image_path):
+            os.remove(image_path)
+        return jsonify({'success': False, 'message': str(e)})
+
+# รัน Flask application
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
